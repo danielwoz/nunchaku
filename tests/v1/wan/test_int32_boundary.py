@@ -5,6 +5,8 @@ and 720P/161f (147712, which overflows the pre-fix int32 M*N offsets).
 Asserts the kernels neither abort nor write garbage at these sizes.
 """
 
+import gc
+
 import pytest
 import torch
 
@@ -46,6 +48,8 @@ def make_linear(in_features: int, out_features: int) -> SVDQW4A4Linear:
 @pytest.mark.parametrize("in_features,out_features", LAYER_SHAPES, ids=["qkv-14b", "ffn-up-14b"])
 @pytest.mark.parametrize("num_tokens", TOKEN_COUNTS)
 def test_no_int32_wrap(num_tokens, in_features, out_features):
+    gc.collect()
+    torch.cuda.empty_cache()
     required_gib = (num_tokens * (in_features + out_features) * 2 * 3) / 2**30
     free_gib = torch.cuda.mem_get_info()[0] / 2**30
     if free_gib < required_gib + 4:
@@ -54,8 +58,14 @@ def test_no_int32_wrap(num_tokens, in_features, out_features):
     x = torch.randn(1, num_tokens, in_features, dtype=torch.bfloat16, device="cuda")
     y = linear(x)
     torch.cuda.synchronize()
+    del x
+    torch.cuda.empty_cache()
     assert y.shape == (1, num_tokens, out_features)
     # zero qweight + zero proj_up + bias 0.5 => every output must be exactly 0.5;
-    # an int32 offset wrap leaves rows unwritten or writes out of bounds
-    assert y.isfinite().all()
-    assert (y.float() - 0.5).abs().max() < 1e-3
+    # an int32 offset wrap leaves rows unwritten or writes out of bounds.
+    # checked in chunks: a full float copy of the output would not fit on 24 GB
+    max_dev = 0.0
+    for chunk in y.view(-1, out_features).split(65536):
+        assert chunk.isfinite().all()
+        max_dev = max(max_dev, float((chunk.float() - 0.5).abs().max()))
+    assert max_dev < 1e-3
