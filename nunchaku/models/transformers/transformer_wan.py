@@ -49,8 +49,9 @@ class NunchakuWanAttention(NunchakuBaseAttention):
         Additional arguments for quantization.
     """
 
-    def __init__(self, other: WanAttention, processor: str = "flashattn2", **kwargs):
+    def __init__(self, other: WanAttention, processor: str = "flashattn2", skips: set[str] | None = None, **kwargs):
         super(NunchakuWanAttention, self).__init__(processor)
+        skips = skips or set()
         self.inner_dim = other.inner_dim
         self.kv_inner_dim = other.kv_inner_dim
         self.heads = other.heads
@@ -61,17 +62,32 @@ class NunchakuWanAttention(NunchakuBaseAttention):
         self.norm_q = other.norm_q
         self.norm_k = other.norm_k
 
+        # skipped units keep the original bf16 linears; the processor falls
+        # back to unfused projections when the fused module is absent
         if other.is_cross_attention:
-            self.to_q = SVDQW4A4Linear.from_linear(other.to_q, **kwargs)
-            with torch.device("meta"):
-                to_kv = fuse_linears([other.to_k, other.to_v])
-            self.to_kv = SVDQW4A4Linear.from_linear(to_kv, **kwargs)
+            if "to_q" in skips:
+                self.to_q = other.to_q
+            else:
+                self.to_q = SVDQW4A4Linear.from_linear(other.to_q, **kwargs)
+            if "to_kv" in skips:
+                self.to_k = other.to_k
+                self.to_v = other.to_v
+            else:
+                with torch.device("meta"):
+                    to_kv = fuse_linears([other.to_k, other.to_v])
+                self.to_kv = SVDQW4A4Linear.from_linear(to_kv, **kwargs)
         else:
-            with torch.device("meta"):
-                to_qkv = fuse_linears([other.to_q, other.to_k, other.to_v])
-            self.to_qkv = SVDQW4A4Linear.from_linear(to_qkv, **kwargs)
+            if "to_qkv" in skips:
+                self.to_q = other.to_q
+                self.to_k = other.to_k
+                self.to_v = other.to_v
+            else:
+                with torch.device("meta"):
+                    to_qkv = fuse_linears([other.to_q, other.to_k, other.to_v])
+                self.to_qkv = SVDQW4A4Linear.from_linear(to_qkv, **kwargs)
         self.to_out = other.to_out
-        self.to_out[0] = SVDQW4A4Linear.from_linear(other.to_out[0], **kwargs)
+        if "to_out.0" not in skips:
+            self.to_out[0] = SVDQW4A4Linear.from_linear(other.to_out[0], **kwargs)
 
         self.add_k_proj = other.add_k_proj
         self.add_v_proj = other.add_v_proj
@@ -125,13 +141,29 @@ class NunchakuWanTransformerBlock(WanTransformerBlock):
         Additional arguments for quantization.
     """
 
-    def __init__(self, other: WanTransformerBlock, **kwargs):
+    def __init__(self, other: WanTransformerBlock, skips: set[str] | None = None, **kwargs):
         super(WanTransformerBlock, self).__init__()
+        skips = skips or set()
         self.norm1 = other.norm1
-        self.attn1 = NunchakuWanAttention(other.attn1, **kwargs)
-        self.attn2 = NunchakuWanAttention(other.attn2, **kwargs)
+        self.attn1 = NunchakuWanAttention(
+            other.attn1, skips={s[len("attn1.") :] for s in skips if s.startswith("attn1.")}, **kwargs
+        )
+        self.attn2 = NunchakuWanAttention(
+            other.attn2, skips={s[len("attn2.") :] for s in skips if s.startswith("attn2.")}, **kwargs
+        )
         self.norm2 = other.norm2
-        self.ffn = NunchakuFeedForward(other.ffn, **kwargs)
+        skip_up, skip_down = "ffn.net.0.proj" in skips, "ffn.net.2" in skips
+        if not skip_up and not skip_down:
+            self.ffn = NunchakuFeedForward(other.ffn, **kwargs)
+        else:
+            # partially skipped: keep the diffusers FeedForward (sequential
+            # forward) and quantize only the non-skipped projection
+            self.ffn = other.ffn
+            if not skip_up:
+                self.ffn.net[0].proj = SVDQW4A4Linear.from_linear(self.ffn.net[0].proj, **kwargs)
+            if not skip_down:
+                self.ffn.net[2] = SVDQW4A4Linear.from_linear(self.ffn.net[2], **kwargs)
+                self.ffn.net[2].act_unsigned = self.ffn.net[2].precision != "nvfp4"
         self.norm3 = other.norm3
         self.scale_shift_table = other.scale_shift_table
 
@@ -199,12 +231,15 @@ class NunchakuWanTransformer3DModel(WanTransformer3DModel, NunchakuModelLoaderMi
             pos_embed_seq_len=pos_embed_seq_len,
         )
 
-    def _patch_model(self, **kwargs):
+    def _patch_model(self, skips: list[str] | None = None, **kwargs):
         """
         Patch the transformer blocks for quantization.
 
         Parameters
         ----------
+        skips : list of str, optional
+            Units to keep unquantized, either globally (``"attn2.to_kv"``) or
+            per block (``"blocks.5.attn2.to_kv"``).
         **kwargs
             Additional arguments for quantization (e.g. ``precision``, ``rank``).
 
@@ -212,8 +247,17 @@ class NunchakuWanTransformer3DModel(WanTransformer3DModel, NunchakuModelLoaderMi
         -------
         self
         """
+        skips = skips or []
         for i, block in enumerate(self.blocks):
-            self.blocks[i] = NunchakuWanTransformerBlock(block, **kwargs)
+            block_skips = set()
+            for skip in skips:
+                if skip.startswith("blocks."):
+                    prefix = f"blocks.{i}."
+                    if skip.startswith(prefix):
+                        block_skips.add(skip[len(prefix) :])
+                else:  # a bare unit name applies to every block
+                    block_skips.add(skip)
+            self.blocks[i] = NunchakuWanTransformerBlock(block, skips=block_skips, **kwargs)
         self._is_initialized = True
         return self
 
@@ -263,7 +307,9 @@ class NunchakuWanTransformer3DModel(WanTransformer3DModel, NunchakuModelLoaderMi
         if torch.cuda.is_available():
             gate_device = device if torch.device(device).type == "cuda" else "cuda"
             check_hardware_compatibility(quantization_config, gate_device)
-        transformer._patch_model(precision=precision, rank=rank)
+        transformer._patch_model(
+            precision=precision, rank=rank, skips=quantization_config.get("skips", None)
+        )
 
         transformer = transformer.to_empty(device=device)
         # re-create the rotary embedding: its frequency buffers are
